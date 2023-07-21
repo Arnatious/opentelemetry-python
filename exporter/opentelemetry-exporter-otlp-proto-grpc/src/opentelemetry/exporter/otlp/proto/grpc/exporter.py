@@ -169,6 +169,7 @@ class OTLPExporterMixin(
             OTEL_EXPORTER_OTLP_ENDPOINT, "http://localhost:4317"
         )
 
+        self.shutdown_event = threading.Event()
         parsed_url = urlparse(self._endpoint)
 
         if parsed_url.scheme == "https":
@@ -300,7 +301,7 @@ class OTLPExporterMixin(
                             self._endpoint,
                             delay,
                         )
-                        sleep(delay)
+                        self.shutdown_event.wait(delay)
                         continue
                     else:
                         logger.error(
@@ -325,6 +326,7 @@ class OTLPExporterMixin(
         # wait for the last export if any
         self._export_lock.acquire(timeout=timeout_millis / 1e3)
         self._shutdown = True
+        self.shutdown_event.set()
         self._export_lock.release()
 
     @property
