@@ -12,21 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gzip
-import logging
-import zlib
-from io import BytesIO
 from os import environ
-from typing import Dict, Optional
-from time import sleep
+from typing import Dict, Optional, Sequence
 
 import requests
 
-from opentelemetry.exporter.otlp.proto.common._internal import (
-    _create_exp_backoff_generator,
-)
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import (
     encode_spans,
+)
+from opentelemetry.exporter.otlp.proto.http.exporter import (
+    OTLPExporterMixin,
+    environ_to_compression,
 )
 from opentelemetry.sdk.environment_variables import (
     OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE,
@@ -34,21 +30,13 @@ from opentelemetry.sdk.environment_variables import (
     OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
     OTEL_EXPORTER_OTLP_TRACES_HEADERS,
     OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
-    OTEL_EXPORTER_OTLP_CERTIFICATE,
-    OTEL_EXPORTER_OTLP_COMPRESSION,
-    OTEL_EXPORTER_OTLP_ENDPOINT,
-    OTEL_EXPORTER_OTLP_HEADERS,
-    OTEL_EXPORTER_OTLP_TIMEOUT,
 )
+from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.exporter.otlp.proto.http import (
-    _OTLP_HTTP_HEADERS,
     Compression,
 )
 from opentelemetry.util.re import parse_env_headers
-
-
-_logger = logging.getLogger(__name__)
 
 
 DEFAULT_COMPRESSION = Compression.NoCompression
@@ -57,9 +45,10 @@ DEFAULT_TRACES_EXPORT_PATH = "v1/traces"
 DEFAULT_TIMEOUT = 10  # in seconds
 
 
-class OTLPSpanExporter(SpanExporter):
-
-    _MAX_RETRY_TIMEOUT = 64
+class OTLPSpanExporter(
+    SpanExporter,
+    OTLPExporterMixin[ReadableSpan, SpanExportResult, SpanExportResult],
+):
 
     def __init__(
         self,
@@ -70,124 +59,57 @@ class OTLPSpanExporter(SpanExporter):
         compression: Optional[Compression] = None,
         session: Optional[requests.Session] = None,
     ):
-        self._endpoint = endpoint or environ.get(
-            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-            _append_trace_path(
-                environ.get(OTEL_EXPORTER_OTLP_ENDPOINT, DEFAULT_ENDPOINT)
-            ),
+        environ_endpoint = self._append_telemetry_signal_path(
+            environ.get(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, DEFAULT_ENDPOINT)
         )
-        self._certificate_file = certificate_file or environ.get(
-            OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE,
-            environ.get(OTEL_EXPORTER_OTLP_CERTIFICATE, True),
-        )
-        headers_string = environ.get(
-            OTEL_EXPORTER_OTLP_TRACES_HEADERS,
-            environ.get(OTEL_EXPORTER_OTLP_HEADERS, ""),
-        )
-        self._headers = headers or parse_env_headers(headers_string)
-        self._timeout = timeout or int(
-            environ.get(
-                OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
-                environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, DEFAULT_TIMEOUT),
-            )
-        )
-        self._compression = compression or _compression_from_env()
-        self._session = session or requests.Session()
-        self._session.headers.update(self._headers)
-        self._session.headers.update(_OTLP_HTTP_HEADERS)
-        if self._compression is not Compression.NoCompression:
-            self._session.headers.update(
-                {"Content-Encoding": self._compression.value}
-            )
-        self._shutdown = False
-
-    def _export(self, serialized_data: str):
-        data = serialized_data
-        if self._compression == Compression.Gzip:
-            gzip_data = BytesIO()
-            with gzip.GzipFile(fileobj=gzip_data, mode="w") as gzip_stream:
-                gzip_stream.write(serialized_data)
-            data = gzip_data.getvalue()
-        elif self._compression == Compression.Deflate:
-            data = zlib.compress(bytes(serialized_data))
-
-        return self._session.post(
-            url=self._endpoint,
-            data=data,
-            verify=self._certificate_file,
-            timeout=self._timeout,
+        if headers is None:
+            environ_headers = environ.get(OTEL_EXPORTER_OTLP_TRACES_HEADERS)
+            if environ_headers is not None:
+                headers = parse_env_headers(environ_headers)
+        if timeout is None:
+            environ_timeout = environ.get(OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+            if environ_timeout is not None:
+                timeout = float(environ_timeout)
+        compression = (
+            environ_to_compression(OTEL_EXPORTER_OTLP_TRACES_COMPRESSION)
+            if compression is None
+            else compression
         )
 
-    @staticmethod
-    def _retryable(resp: requests.Response) -> bool:
-        if resp.status_code == 408:
-            return True
-        if resp.status_code >= 500 and resp.status_code <= 599:
-            return True
-        return False
-
-    def export(self, spans) -> SpanExportResult:
-        # After the call to Shutdown subsequent calls to Export are
-        # not allowed and should return a Failure result.
-        if self._shutdown:
-            _logger.warning("Exporter already shutdown, ignoring batch")
-            return SpanExportResult.FAILURE
-
-        serialized_data = encode_spans(spans).SerializeToString()
-
-        for delay in _create_exp_backoff_generator(
-            max_value=self._MAX_RETRY_TIMEOUT
-        ):
-
-            if delay == self._MAX_RETRY_TIMEOUT:
-                return SpanExportResult.FAILURE
-
-            resp = self._export(serialized_data)
-            # pylint: disable=no-else-return
-            if resp.ok:
-                return SpanExportResult.SUCCESS
-            elif self._retryable(resp):
-                _logger.warning(
-                    "Transient error %s encountered while exporting span batch, retrying in %ss.",
-                    resp.reason,
-                    delay,
-                )
-                sleep(delay)
-                continue
-            else:
-                _logger.error(
-                    "Failed to export batch code: %s, reason: %s",
-                    resp.status_code,
-                    resp.text,
-                )
-                return SpanExportResult.FAILURE
-        return SpanExportResult.FAILURE
-
-    def shutdown(self):
-        if self._shutdown:
-            _logger.warning("Exporter already shutdown, ignoring call")
-            return
-        self._session.close()
-        self._shutdown = True
+        super().__init__(
+            endpoint=endpoint or environ_endpoint,
+            certificate_file=certificate_file
+            or environ.get(OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE),
+            headers=headers,
+            timeout=timeout,
+            compression=compression,
+            session=session,
+        )
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         """Nothing is buffered in this exporter, so this method does nothing."""
         return True
 
-
-def _compression_from_env() -> Compression:
-    compression = (
-        environ.get(
-            OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
-            environ.get(OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
+    def export(
+        self,
+        data: Sequence[ReadableSpan],
+        timeout_millis: int = 10_000,
+        **kwargs,
+    ) -> SpanExportResult:
+        return self._export(
+            encode_spans(data).SerializeToString(),
+            timeout_millis=timeout_millis,
         )
-        .lower()
-        .strip()
-    )
-    return Compression(compression)
 
+    @property
+    def _result(self):
+        return SpanExportResult
 
-def _append_trace_path(endpoint: str) -> str:
-    if endpoint.endswith("/"):
-        return endpoint + DEFAULT_TRACES_EXPORT_PATH
-    return endpoint + f"/{DEFAULT_TRACES_EXPORT_PATH}"
+    @property
+    def _exporting(self) -> str:
+        return "span"
+
+    def _append_telemetry_signal_path(self, endpoint: str) -> str:
+        if endpoint.endswith("/"):
+            return endpoint + DEFAULT_TRACES_EXPORT_PATH
+        return endpoint + f"/{DEFAULT_TRACES_EXPORT_PATH}"

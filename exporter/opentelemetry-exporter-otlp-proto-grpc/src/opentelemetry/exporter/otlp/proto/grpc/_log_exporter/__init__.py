@@ -104,7 +104,12 @@ class OTLPLogExporter(
     ) -> ExportLogsServiceRequest:
         return encode_logs(data)
 
-    def export(self, batch: Sequence[LogData], timeout_millis: Optional[float] = None, **kwargs) -> LogExportResult:
+    def export(
+        self,
+        batch: Sequence[LogData],
+        timeout_millis: float = 10_000,
+        **kwargs,
+    ) -> LogExportResult:
         return self._export(batch, timeout_millis=timeout_millis)
 
     def shutdown(self, timeout_millis: float = 30_000, **kwargs) -> None:

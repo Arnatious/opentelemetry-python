@@ -156,6 +156,7 @@ class OTLPMetricExporter(
         timeout_millis: float = 10_000,
         **kwargs,
     ) -> MetricExportResult:
+        timeout_millis = min(timeout_millis, self._timeout * 1e3)
         deadline_millis = timeout_millis + (time() * 1e3)
 
         if self._max_export_batch_size is None:

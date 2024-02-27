@@ -211,3 +211,11 @@ Y
     """
     for i in _create_exp_backoff_generator(max_value):
         yield uniform(0,i)
+
+class InvalidCompressionValueException(Exception):
+    def __init__(self, environ_key: str, environ_value: str):
+        super().__init__(
+            'Invalid value "{}" for compression envvar {}'.format(
+                environ_value, environ_key
+            )
+        )

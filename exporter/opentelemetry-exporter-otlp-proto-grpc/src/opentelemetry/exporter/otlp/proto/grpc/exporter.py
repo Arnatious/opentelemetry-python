@@ -16,12 +16,10 @@
 
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Sequence  # noqa: F401
 from logging import getLogger
 from os import environ
 from time import time
-from typing import (  # noqa: F401
-    Any,
+from typing import (
     Callable,
     Dict,
     Generic,
@@ -39,6 +37,7 @@ from deprecated import deprecated
 from opentelemetry.exporter.otlp.proto.common._internal import (
     _get_resource_data,
     _create_exp_backoff_with_jitter_generator,
+    InvalidCompressionValueException
 )
 from google.rpc.error_details_pb2 import RetryInfo
 from grpc import (
@@ -87,15 +86,6 @@ _ENVIRON_TO_COMPRESSION = {
 _DEFAULT_EXPORT_TIMEOUT_S = 10
 
 
-class InvalidCompressionValueException(Exception):
-    def __init__(self, environ_key: str, environ_value: str):
-        super().__init__(
-            'Invalid value "{}" for compression envvar {}'.format(
-                environ_value, environ_key
-            )
-        )
-
-
 def environ_to_compression(environ_key: str) -> Optional[Compression]:
     environ_value = (
         environ[environ_key].lower().strip()
@@ -142,7 +132,7 @@ def _get_credentials(creds, environ_key):
 class OTLPExporterMixin(
     ABC, Generic[SDKDataT, ExportServiceRequestT, ExportResultT]
 ):
-    """OTLP span exporter
+    """OTLP exporter
 
     Args:
         endpoint: OpenTelemetry Collector receiver endpoint
@@ -233,9 +223,9 @@ class OTLPExporterMixin(
         pass
 
     def _export(
-        self, 
-        data: Union[TypingSequence[ReadableSpan], MetricsData], 
-        *, 
+        self,
+        data: Union[TypingSequence[ReadableSpan], MetricsData],
+        *,
         timeout_millis: Optional[float] = None,
     ) -> ExportResultT:
         # After the call to shutdown, subsequent calls to Export are
@@ -244,25 +234,26 @@ class OTLPExporterMixin(
             logger.warning("Exporter already shutdown, ignoring batch")
             return self._result.FAILURE
 
-        if timeout_millis is None:
-            timeout_s = self._timeout
-        else:
-            # Use the lowest of the possible timeouts
-            timeout_s = min((timeout_millis / 1e3), self._timeout)
+        # Use the lowest of the possible timeouts
+        timeout_s = min((timeout_millis / 1e3), self._timeout)
         deadline_s = time() + timeout_s
         # We acquire a lock to prevent shutdown from interrupting us
         try:
             if not self._export_lock.acquire(timeout=timeout_s):
-                logger.warning("Exporter failed to acquire lock before timeout")
+                logger.warning(
+                    "Exporter failed to acquire lock before timeout"
+                )
                 return self._result.FAILURE
-            # _create_exp_backoff_with_jitter returns a generator that yields random delay 
+            # _create_exp_backoff_with_jitter returns a generator that yields random delay
             # values whose upper bounds grow exponentially. The upper bound will cap at max
             # value (never wait more than 64 seconds at once)
             max_value = 64
-            for delay_s in _create_exp_backoff_with_jitter_generator(max_value=max_value):
+            for delay_s in _create_exp_backoff_with_jitter_generator(
+                max_value=max_value
+            ):
                 remaining_time_s = deadline_s - time()
-                
-                if (remaining_time_s < 1e-09):
+
+                if remaining_time_s < 1e-09:
                     logger.warning(
                         "Timed out exporting %s to %s",
                         self._exporting,
@@ -270,14 +261,14 @@ class OTLPExporterMixin(
                     )
                     return self._result.FAILURE
 
-                if (self._shutdown.is_set()):
+                if self._shutdown.is_set():
                     logger.warning(
                         "Shutdown encountered while exporting %s to %s",
                         self._exporting,
                         self._endpoint,
                     )
                     return self._result.FAILURE
-            
+
                 try:
                     self._client.Export(
                         request=self._translate_data(data),
@@ -296,6 +287,7 @@ class OTLPExporterMixin(
                         StatusCode.UNAVAILABLE,
                         StatusCode.DATA_LOSS,
                     ]:
+                        # Not retryable, bail out
                         logger.error(
                             "Failed to export %s to %s, error code: %s",
                             self._exporting,
@@ -308,8 +300,9 @@ class OTLPExporterMixin(
                             return self._result.SUCCESS
 
                         return self._result.FAILURE
-                    
+
                     time_remaining_s = deadline_s - time()
+                    delay_s = min(delay_s, time_remaining_s)
                     retry_info_bin = dict(error.trailing_metadata()).get(
                         "google.rpc.retryinfo-bin"
                     )
@@ -320,12 +313,10 @@ class OTLPExporterMixin(
                             retry_info.retry_delay.seconds
                             + retry_info.retry_delay.nanos / 1.0e9
                         )
-                        if (delay_s > time_remaining_s):
+                        if delay_s > time_remaining_s:
                             # We should not retry before the requested interval, so
                             # we must fail out prematurely
                             return self._result.FAILURE
-                        
-                    delay_s = min(delay_s, time_remaining_s)
 
                     logger.warning(
                         (
@@ -340,7 +331,6 @@ class OTLPExporterMixin(
                     self._shutdown.wait(delay_s)
         finally:
             self._export_lock.release()
-
 
         return self._result.FAILURE
 
@@ -361,5 +351,13 @@ class OTLPExporterMixin(
         """
         Returns a string that describes the overall exporter, to be used in
         warning messages.
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def _result(self) -> ExportResultT:
+        """
+        Enum defining export result states to be used.
         """
         pass

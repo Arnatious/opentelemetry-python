@@ -11,20 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gzip
-import logging
-import zlib
 from os import environ
 from typing import Dict, Optional, Any, Callable, List
-from typing import Sequence, Mapping  # noqa: F401
 
-from io import BytesIO
-from time import sleep
 from deprecated import deprecated
 
 from opentelemetry.exporter.otlp.proto.common._internal import (
     _get_resource_data,
-    _create_exp_backoff_generator,
 )
 from opentelemetry.exporter.otlp.proto.common._internal.metrics_encoder import (
     OTLPMetricExporterMixin,
@@ -33,6 +26,7 @@ from opentelemetry.exporter.otlp.proto.common.metrics_encoder import (
     encode_metrics,
 )
 from opentelemetry.exporter.otlp.proto.http import Compression
+from opentelemetry.exporter.otlp.proto.http.exporter import OTLPExporterMixin, environ_to_compression
 from opentelemetry.sdk.metrics._internal.aggregation import Aggregation
 from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (  # noqa: F401
     ExportMetricsServiceRequest,
@@ -49,11 +43,6 @@ from opentelemetry.proto.common.v1.common_pb2 import (  # noqa: F401
 from opentelemetry.proto.resource.v1.resource_pb2 import Resource  # noqa: F401
 from opentelemetry.proto.metrics.v1 import metrics_pb2 as pb2  # noqa: F401
 from opentelemetry.sdk.environment_variables import (
-    OTEL_EXPORTER_OTLP_ENDPOINT,
-    OTEL_EXPORTER_OTLP_CERTIFICATE,
-    OTEL_EXPORTER_OTLP_HEADERS,
-    OTEL_EXPORTER_OTLP_TIMEOUT,
-    OTEL_EXPORTER_OTLP_COMPRESSION,
     OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
     OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE,
     OTEL_EXPORTER_OTLP_METRICS_HEADERS,
@@ -79,8 +68,6 @@ from opentelemetry.proto.resource.v1.resource_pb2 import (
     Resource as PB2Resource,
 )
 
-_logger = logging.getLogger(__name__)
-
 
 DEFAULT_COMPRESSION = Compression.NoCompression
 DEFAULT_ENDPOINT = "http://localhost:4318/"
@@ -88,9 +75,11 @@ DEFAULT_METRICS_EXPORT_PATH = "v1/metrics"
 DEFAULT_TIMEOUT = 10  # in seconds
 
 
-class OTLPMetricExporter(MetricExporter, OTLPMetricExporterMixin):
-
-    _MAX_RETRY_TIMEOUT = 64
+class OTLPMetricExporter(
+    MetricExporter,
+    OTLPMetricExporterMixin,
+    OTLPExporterMixin[MetricsData, MetricExporter, MetricExportResult],
+):
 
     def __init__(
         self,
@@ -103,57 +92,39 @@ class OTLPMetricExporter(MetricExporter, OTLPMetricExporterMixin):
         preferred_temporality: Dict[type, AggregationTemporality] = None,
         preferred_aggregation: Dict[type, Aggregation] = None,
     ):
-        self._endpoint = endpoint or environ.get(
-            OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
-            _append_metrics_path(
-                environ.get(OTEL_EXPORTER_OTLP_ENDPOINT, DEFAULT_ENDPOINT)
-            ),
+        environ_endpoint = self._append_telemetry_signal_path(
+            environ.get(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, DEFAULT_ENDPOINT)
         )
-        self._certificate_file = certificate_file or environ.get(
-            OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE,
-            environ.get(OTEL_EXPORTER_OTLP_CERTIFICATE, True),
+        if headers is None:
+            environ_headers = environ.get(OTEL_EXPORTER_OTLP_METRICS_HEADERS)
+            if environ_headers is not None:
+                headers = parse_env_headers(environ_headers)
+        if timeout is None:
+            environ_timeout = environ.get(OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)
+            if environ_timeout is not None:
+                timeout = float(environ_timeout)
+        compression = (
+            environ_to_compression(OTEL_EXPORTER_OTLP_TRACES_COMPRESSION)
+            if compression is None
+            else compression
         )
-        headers_string = environ.get(
-            OTEL_EXPORTER_OTLP_METRICS_HEADERS,
-            environ.get(OTEL_EXPORTER_OTLP_HEADERS, ""),
-        )
-        self._headers = headers or parse_env_headers(headers_string)
-        self._timeout = timeout or int(
-            environ.get(
-                OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
-                environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, DEFAULT_TIMEOUT),
-            )
-        )
-        self._compression = compression or _compression_from_env()
-        self._session = session or requests.Session()
-        self._session.headers.update(self._headers)
-        self._session.headers.update(
+        headers.update(
             {"Content-Type": "application/x-protobuf"}
         )
-        if self._compression is not Compression.NoCompression:
-            self._session.headers.update(
-                {"Content-Encoding": self._compression.value}
-            )
-
+        
         self._common_configuration(
             preferred_temporality, preferred_aggregation
         )
 
-    def _export(self, serialized_data: str):
-        data = serialized_data
-        if self._compression == Compression.Gzip:
-            gzip_data = BytesIO()
-            with gzip.GzipFile(fileobj=gzip_data, mode="w") as gzip_stream:
-                gzip_stream.write(serialized_data)
-            data = gzip_data.getvalue()
-        elif self._compression == Compression.Deflate:
-            data = zlib.compress(bytes(serialized_data))
-
-        return self._session.post(
-            url=self._endpoint,
-            data=data,
-            verify=self._certificate_file,
-            timeout=self._timeout,
+        OTLPExporterMixin.__init__(
+            self,
+            endpoint=endpoint or environ_endpoint,
+            certificate_file=certificate_file
+            or environ.get(OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE),
+            headers=headers,
+            timeout=timeout,
+            compression=compression,
+            session=session,
         )
 
     @staticmethod
@@ -170,37 +141,15 @@ class OTLPMetricExporter(MetricExporter, OTLPMetricExporterMixin):
         timeout_millis: float = 10_000,
         **kwargs,
     ) -> MetricExportResult:
-        serialized_data = encode_metrics(metrics_data)
-        for delay in _create_exp_backoff_generator(
-            max_value=self._MAX_RETRY_TIMEOUT
-        ):
-
-            if delay == self._MAX_RETRY_TIMEOUT:
-                return MetricExportResult.FAILURE
-
-            resp = self._export(serialized_data.SerializeToString())
-            # pylint: disable=no-else-return
-            if resp.ok:
-                return MetricExportResult.SUCCESS
-            elif self._retryable(resp):
-                _logger.warning(
-                    "Transient error %s encountered while exporting metric batch, retrying in %ss.",
-                    resp.reason,
-                    delay,
-                )
-                sleep(delay)
-                continue
-            else:
-                _logger.error(
-                    "Failed to export batch code: %s, reason: %s",
-                    resp.status_code,
-                    resp.text,
-                )
-                return MetricExportResult.FAILURE
-        return MetricExportResult.FAILURE
-
+        serialized_data = encode_metrics(metrics_data).SerializeToString
+        return self._export(serialized_data=serialized_data, timeout_millis=timeout_millis)
+    
     def shutdown(self, timeout_millis: float = 30_000, **kwargs) -> None:
         pass
+
+    @property
+    def _result(self):
+        return MetricExportResult
 
     @property
     def _exporting(self) -> str:
@@ -209,6 +158,11 @@ class OTLPMetricExporter(MetricExporter, OTLPMetricExporterMixin):
     def force_flush(self, timeout_millis: float = 10_000) -> bool:
         """Nothing is buffered in this exporter, so this method does nothing."""
         return True
+        
+    def _append_telemetry_signal_path(endpoint: str) -> str:
+        if endpoint.endswith("/"):
+            return endpoint + DEFAULT_METRICS_EXPORT_PATH
+        return endpoint + f"/{DEFAULT_METRICS_EXPORT_PATH}"
 
 
 @deprecated(
@@ -221,21 +175,3 @@ def get_resource_data(
     name: str,
 ) -> List[PB2Resource]:
     return _get_resource_data(sdk_resource_scope_data, resource_class, name)
-
-
-def _compression_from_env() -> Compression:
-    compression = (
-        environ.get(
-            OTEL_EXPORTER_OTLP_METRICS_COMPRESSION,
-            environ.get(OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
-        )
-        .lower()
-        .strip()
-    )
-    return Compression(compression)
-
-
-def _append_metrics_path(endpoint: str) -> str:
-    if endpoint.endswith("/"):
-        return endpoint + DEFAULT_METRICS_EXPORT_PATH
-    return endpoint + f"/{DEFAULT_METRICS_EXPORT_PATH}"
