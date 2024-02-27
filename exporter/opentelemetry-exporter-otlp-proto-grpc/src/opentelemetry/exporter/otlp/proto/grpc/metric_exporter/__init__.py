@@ -14,6 +14,7 @@
 from dataclasses import replace
 from logging import getLogger
 from os import environ
+from time import time
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 from typing import Sequence as TypingSequence
 from grpc import ChannelCredentials, Compression
@@ -155,14 +156,16 @@ class OTLPMetricExporter(
         timeout_millis: float = 10_000,
         **kwargs,
     ) -> MetricExportResult:
-        # TODO(#2663): OTLPExporterMixin should pass timeout to gRPC
+        deadline_millis = timeout_millis + (time() * 1e3)
+
         if self._max_export_batch_size is None:
             return self._export(data=metrics_data)
 
         export_result = MetricExportResult.SUCCESS
 
         for split_metrics_data in self._split_metrics_data(metrics_data):
-            split_export_result = self._export(data=split_metrics_data)
+            remaining_time_millis = deadline_millis - (time() * 1e3)
+            split_export_result = self._export(data=split_metrics_data, timeout_millis=remaining_time_millis)
 
             if split_export_result is MetricExportResult.FAILURE:
                 export_result = MetricExportResult.FAILURE

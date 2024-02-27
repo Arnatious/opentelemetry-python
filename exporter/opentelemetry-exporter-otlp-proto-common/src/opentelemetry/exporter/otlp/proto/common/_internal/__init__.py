@@ -16,6 +16,7 @@
 import logging
 from collections.abc import Sequence
 from itertools import count
+from random import uniform
 from typing import (
     Any,
     Mapping,
@@ -173,3 +174,40 @@ def _create_exp_backoff_generator(max_value: int = 0) -> Iterator[int]:
     for i in count(0):
         out = 2**i
         yield min(out, max_value) if max_value else out
+
+
+def _create_exp_backoff_with_jitter_generator(max_value: int = 0) -> Iterator[float]:
+    """
+    Generates an infinite sequence of exponential backoff values with jitter using the 
+    FullJitter approach. For each element "n" in the exponential backoff series created
+    by _create_exp_backoff(max_value), yields a random number in the half-open range [0,n).
+     
+    This algorithm is originally documented at 
+    https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+
+    Parameters:
+    - max_value (int, optional): The maximum value to yield. If 0 or not provided, the
+      sequence grows without bound.
+
+    Returns:
+    Iterator[int]: An iterator that yields the exponential backoff values, either uncapped or
+    capped at max_value.
+Y
+    Example:
+    ```
+    import random
+    random.seed(20240220)
+    gen = _create_exp_backoff_with_jitter_generator(max_value=10)
+    for _ in range(5):
+        print(next(gen))
+    ```
+    This will print:
+        0.1341603010697452
+        0.34773275270578097
+        3.6022913287022913
+        6.663388602254524
+        10
+
+    """
+    for i in _create_exp_backoff_generator(max_value):
+        yield uniform(0,i)

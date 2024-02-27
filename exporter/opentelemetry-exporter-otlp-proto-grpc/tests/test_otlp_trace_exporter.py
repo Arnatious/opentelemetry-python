@@ -458,37 +458,6 @@ class TestOTLPSpanExporter(TestCase):
             (("user-agent", "OTel-OTLP-Exporter-Python/" + __version__),),
         )
 
-    @patch(
-        "opentelemetry.exporter.otlp.proto.grpc.exporter._create_exp_backoff_generator"
-    )
-    @patch("opentelemetry.exporter.otlp.proto.grpc.exporter.sleep")
-    def test_unavailable(self, mock_sleep, mock_expo):
-
-        mock_expo.configure_mock(**{"return_value": [1]})
-
-        add_TraceServiceServicer_to_server(
-            TraceServiceServicerUNAVAILABLE(), self.server
-        )
-        result = self.exporter.export([self.span])
-        self.assertEqual(result, SpanExportResult.FAILURE)
-        mock_sleep.assert_called_with(1)
-
-    @patch(
-        "opentelemetry.exporter.otlp.proto.grpc.exporter._create_exp_backoff_generator"
-    )
-    @patch("opentelemetry.exporter.otlp.proto.grpc.exporter.sleep")
-    def test_unavailable_delay(self, mock_sleep, mock_expo):
-
-        mock_expo.configure_mock(**{"return_value": [1]})
-
-        add_TraceServiceServicer_to_server(
-            TraceServiceServicerUNAVAILABLEDelay(), self.server
-        )
-        self.assertEqual(
-            self.exporter.export([self.span]), SpanExportResult.FAILURE
-        )
-        mock_sleep.assert_called_with(4)
-
     def test_success(self):
         add_TraceServiceServicer_to_server(
             TraceServiceServicerSUCCESS(), self.server

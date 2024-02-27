@@ -23,7 +23,7 @@ from time import sleep
 import requests
 
 from opentelemetry.exporter.otlp.proto.common._internal import (
-    _create_exp_backoff_generator,
+    _create_exp_backoff_with_jitter_generator,
 )
 from opentelemetry.exporter.otlp.proto.common._log_encoder import encode_logs
 from opentelemetry.sdk.environment_variables import (

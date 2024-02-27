@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence  # noqa: F401
 from logging import getLogger
 from os import environ
-from time import sleep
+from time import time
 from typing import (  # noqa: F401
     Any,
     Callable,
@@ -38,7 +38,7 @@ from deprecated import deprecated
 
 from opentelemetry.exporter.otlp.proto.common._internal import (
     _get_resource_data,
-    _create_exp_backoff_generator,
+    _create_exp_backoff_with_jitter_generator,
 )
 from google.rpc.error_details_pb2 import RetryInfo
 from grpc import (
@@ -84,6 +84,7 @@ _ENVIRON_TO_COMPRESSION = {
     None: None,
     "gzip": Compression.Gzip,
 }
+_DEFAULT_EXPORT_TIMEOUT_S = 10
 
 
 class InvalidCompressionValueException(Exception):
@@ -160,7 +161,7 @@ class OTLPExporterMixin(
         headers: Optional[
             Union[TypingSequence[Tuple[str, str]], Dict[str, str], str]
         ] = None,
-        timeout: Optional[int] = None,
+        timeout: Optional[float] = None,
         compression: Optional[Compression] = None,
     ):
         super().__init__()
@@ -197,8 +198,8 @@ class OTLPExporterMixin(
         else:
             self._headers = tuple(self._headers) + tuple(_OTLP_GRPC_HEADERS)
 
-        self._timeout = timeout or int(
-            environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, 10)
+        self._timeout = timeout or float(
+            environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, _DEFAULT_EXPORT_TIMEOUT_S)
         )
         self._collector_kwargs = None
 
@@ -223,7 +224,7 @@ class OTLPExporterMixin(
             )
 
         self._export_lock = threading.Lock()
-        self._shutdown = False
+        self._shutdown: threading.Event = threading.Event()
 
     @abstractmethod
     def _translate_data(
@@ -232,44 +233,61 @@ class OTLPExporterMixin(
         pass
 
     def _export(
-        self, data: Union[TypingSequence[ReadableSpan], MetricsData]
+        self, 
+        data: Union[TypingSequence[ReadableSpan], MetricsData], 
+        *, 
+        timeout_millis: Optional[float] = None,
     ) -> ExportResultT:
         # After the call to shutdown, subsequent calls to Export are
         # not allowed and should return a Failure result.
-        if self._shutdown:
+        if self._shutdown.is_set():
             logger.warning("Exporter already shutdown, ignoring batch")
             return self._result.FAILURE
 
-        # FIXME remove this check if the export type for traces
-        # gets updated to a class that represents the proto
-        # TracesData and use the code below instead.
-        # logger.warning(
-        #     "Transient error %s encountered while exporting %s, retrying in %ss.",
-        #     error.code(),
-        #     data.__class__.__name__,
-        #     delay,
-        # )
-        max_value = 64
-        # expo returns a generator that yields delay values which grow
-        # exponentially. Once delay is greater than max_value, the yielded
-        # value will remain constant.
-        for delay in _create_exp_backoff_generator(max_value=max_value):
-            if delay == max_value or self._shutdown:
+        if timeout_millis is None:
+            timeout_s = self._timeout
+        else:
+            # Use the lowest of the possible timeouts
+            timeout_s = min((timeout_millis / 1e3), self._timeout)
+        deadline_s = time() + timeout_s
+        # We acquire a lock to prevent shutdown from interrupting us
+        try:
+            if not self._export_lock.acquire(timeout=timeout_s):
+                logger.warning("Exporter failed to acquire lock before timeout")
                 return self._result.FAILURE
+            # _create_exp_backoff_with_jitter returns a generator that yields random delay 
+            # values whose upper bounds grow exponentially. The upper bound will cap at max
+            # value (never wait more than 64 seconds at once)
+            max_value = 64
+            for delay_s in _create_exp_backoff_with_jitter_generator(max_value=max_value):
+                remaining_time_s = deadline_s - time()
+                
+                if (remaining_time_s < 1e-09):
+                    logger.warning(
+                        "Timed out exporting %s to %s",
+                        self._exporting,
+                        self._endpoint,
+                    )
+                    return self._result.FAILURE
 
-            with self._export_lock:
+                if (self._shutdown.is_set()):
+                    logger.warning(
+                        "Shutdown encountered while exporting %s to %s",
+                        self._exporting,
+                        self._endpoint,
+                    )
+                    return self._result.FAILURE
+            
                 try:
                     self._client.Export(
                         request=self._translate_data(data),
                         metadata=self._headers,
-                        timeout=self._timeout,
+                        timeout=remaining_time_s,
                     )
-
                     return self._result.SUCCESS
 
                 except RpcError as error:
-
-                    if error.code() in [
+                    if error.code() not in [
                         StatusCode.CANCELLED,
                         StatusCode.DEADLINE_EXCEEDED,
                         StatusCode.RESOURCE_EXHAUSTED,
@@ -278,31 +296,6 @@ class OTLPExporterMixin(
                         StatusCode.UNAVAILABLE,
                         StatusCode.DATA_LOSS,
                     ]:
-
-                        retry_info_bin = dict(error.trailing_metadata()).get(
-                            "google.rpc.retryinfo-bin"
-                        )
-                        if retry_info_bin is not None:
-                            retry_info = RetryInfo()
-                            retry_info.ParseFromString(retry_info_bin)
-                            delay = (
-                                retry_info.retry_delay.seconds
-                                + retry_info.retry_delay.nanos / 1.0e9
-                            )
-
-                        logger.warning(
-                            (
-                                "Transient error %s encountered while exporting "
-                                "%s to %s, retrying in %ss."
-                            ),
-                            error.code(),
-                            self._exporting,
-                            self._endpoint,
-                            delay,
-                        )
-                        sleep(delay)
-                        continue
-                    else:
                         logger.error(
                             "Failed to export %s to %s, error code: %s",
                             self._exporting,
@@ -311,21 +304,56 @@ class OTLPExporterMixin(
                             exc_info=error.code() == StatusCode.UNKNOWN,
                         )
 
-                    if error.code() == StatusCode.OK:
-                        return self._result.SUCCESS
+                        if error.code() == StatusCode.OK:
+                            return self._result.SUCCESS
 
-                    return self._result.FAILURE
+                        return self._result.FAILURE
+                    
+                    time_remaining_s = deadline_s - time()
+                    retry_info_bin = dict(error.trailing_metadata()).get(
+                        "google.rpc.retryinfo-bin"
+                    )
+                    if retry_info_bin is not None:
+                        retry_info = RetryInfo()
+                        retry_info.ParseFromString(retry_info_bin)
+                        delay_s = (
+                            retry_info.retry_delay.seconds
+                            + retry_info.retry_delay.nanos / 1.0e9
+                        )
+                        if (delay_s > time_remaining_s):
+                            # We should not retry before the requested interval, so
+                            # we must fail out prematurely
+                            return self._result.FAILURE
+                        
+                    delay_s = min(delay_s, time_remaining_s)
+
+                    logger.warning(
+                        (
+                            "Transient error %s encountered while exporting "
+                            "%s to %s, retrying in %ss."
+                        ),
+                        error.code(),
+                        self._exporting,
+                        self._endpoint,
+                        delay_s,
+                    )
+                    self._shutdown.wait(delay_s)
+        finally:
+            self._export_lock.release()
+
 
         return self._result.FAILURE
 
     def shutdown(self, timeout_millis: float = 30_000, **kwargs) -> None:
-        if self._shutdown:
+        if self._shutdown.is_set():
             logger.warning("Exporter already shutdown, ignoring call")
             return
-        # wait for the last export if any
-        self._export_lock.acquire(timeout=timeout_millis / 1e3)
-        self._shutdown = True
-        self._export_lock.release()
+        # Wait for the current export to finish. Shutdown timeout preempts export
+        # to prevent application hanging after completion.
+        locked = self._export_lock.acquire(timeout=timeout_millis / 1e3)
+        self._shutdown.set()
+        if locked:
+            self._export_lock.release()
 
     @property
     @abstractmethod

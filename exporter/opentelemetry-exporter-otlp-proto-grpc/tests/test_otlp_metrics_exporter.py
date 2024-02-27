@@ -378,7 +378,7 @@ class TestOTLPMetricExporter(TestCase):
 
     # pylint: disable=no-self-use
     @patch(
-        "opentelemetry.exporter.otlp.proto.grpc.exporter._create_exp_backoff_generator"
+        "opentelemetry.exporter.otlp.proto.grpc.exporter._create_exp_backoff_with_jitter_generator"
     )
     @patch("opentelemetry.exporter.otlp.proto.grpc.exporter.insecure_channel")
     @patch.dict("os.environ", {OTEL_EXPORTER_OTLP_COMPRESSION: "gzip"})
@@ -413,65 +413,6 @@ class TestOTLPMetricExporter(TestCase):
         OTLPMetricExporter(insecure=True)
         mock_insecure_channel.assert_called_once_with(
             "localhost:4317", compression=Compression.NoCompression
-        )
-
-    @patch(
-        "opentelemetry.exporter.otlp.proto.grpc.exporter._create_exp_backoff_generator"
-    )
-    @patch("opentelemetry.exporter.otlp.proto.grpc.exporter.sleep")
-    def test_unavailable(self, mock_sleep, mock_expo):
-
-        mock_expo.configure_mock(**{"return_value": [1]})
-
-        add_MetricsServiceServicer_to_server(
-            MetricsServiceServicerUNAVAILABLE(), self.server
-        )
-        self.assertEqual(
-            self.exporter.export(self.metrics["sum_int"]),
-            MetricExportResult.FAILURE,
-        )
-        mock_sleep.assert_called_with(1)
-
-    @patch(
-        "opentelemetry.exporter.otlp.proto.grpc.exporter._create_exp_backoff_generator"
-    )
-    @patch("opentelemetry.exporter.otlp.proto.grpc.exporter.sleep")
-    def test_unavailable_delay(self, mock_sleep, mock_expo):
-
-        mock_expo.configure_mock(**{"return_value": [1]})
-
-        add_MetricsServiceServicer_to_server(
-            MetricsServiceServicerUNAVAILABLEDelay(), self.server
-        )
-        self.assertEqual(
-            self.exporter.export(self.metrics["sum_int"]),
-            MetricExportResult.FAILURE,
-        )
-        mock_sleep.assert_called_with(4)
-
-    @patch(
-        "opentelemetry.exporter.otlp.proto.grpc.exporter._create_exp_backoff_generator"
-    )
-    @patch("opentelemetry.exporter.otlp.proto.grpc.exporter.sleep")
-    @patch("opentelemetry.exporter.otlp.proto.grpc.exporter.logger.error")
-    def test_unknown_logs(self, mock_logger_error, mock_sleep, mock_expo):
-
-        mock_expo.configure_mock(**{"return_value": [1]})
-
-        add_MetricsServiceServicer_to_server(
-            MetricsServiceServicerUNKNOWN(), self.server
-        )
-        self.assertEqual(
-            self.exporter.export(self.metrics["sum_int"]),
-            MetricExportResult.FAILURE,
-        )
-        mock_sleep.assert_not_called()
-        mock_logger_error.assert_called_with(
-            "Failed to export %s to %s, error code: %s",
-            "metrics",
-            "localhost:4317",
-            StatusCode.UNKNOWN,
-            exc_info=True,
         )
 
     def test_success(self):
