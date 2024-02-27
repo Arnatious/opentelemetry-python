@@ -39,6 +39,7 @@ from opentelemetry.exporter.otlp.proto.http import (
     Compression,
 )
 from opentelemetry.sdk.environment_variables import (
+    OTEL_EXPORTER_OTLP_ENDPOINT,
     OTEL_EXPORTER_OTLP_CERTIFICATE,
     OTEL_EXPORTER_OTLP_COMPRESSION,
     OTEL_EXPORTER_OTLP_HEADERS,
@@ -68,22 +69,25 @@ class OTLPExporterMixin(
         certificate_file: Name of file containing certificate for server authentication
         headers: Headers to send when exporting
         timeout: Backend request timeout in seconds
-        compression: gRPC compression method to use
+        compression: compression method to use
         session: Requests session to use
     """
 
     def __init__(
         self,
-        endpoint: str,
+        *args,
+        endpoint: Optional[str] = None,
         certificate_file: Optional[str] = None,
         headers: Optional[Dict[str, str],] = None,
-        timeout: Optional[float] = None,
         compression: Optional[Compression] = None,
         session: Optional[requests.Session] = None,
+        **kwargs,
     ):
         super().__init__()
 
-        self._endpoint = endpoint
+        self._endpoint = endpoint or environ.get(
+            OTEL_EXPORTER_OTLP_ENDPOINT, "http://localhost:4318"
+        )
         self._certificate_file = certificate_file or environ.get(
             OTEL_EXPORTER_OTLP_CERTIFICATE, True
         )
@@ -91,15 +95,12 @@ class OTLPExporterMixin(
         self._headers = headers or parse_env_headers(
             environ.get(OTEL_EXPORTER_OTLP_HEADERS, "")
         )
-        self._timeout = timeout or float(
-            environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, _DEFAULT_EXPORT_TIMEOUT_S)
-        )
         self._compression = (
             environ_to_compression(OTEL_EXPORTER_OTLP_COMPRESSION)
             if compression is None
             else compression
         ) or Compression.NoCompression
-        
+
         self._session = session or requests.Session()
         self._session.headers.update(self._headers)
         self._session.headers.update(_OTLP_HTTP_HEADERS)
@@ -108,7 +109,6 @@ class OTLPExporterMixin(
                 {"Content-Encoding": self._compression.value}
             )
 
-        
         self._shutdown = threading.Event()
         self._export_lock = threading.Lock()
 
@@ -130,7 +130,7 @@ class OTLPExporterMixin(
         )
 
     def _export(
-        self, data: bytes, *, timeout_millis: Optional[float] = None
+        self, data: bytes, *, timeout_millis: float = _DEFAULT_EXPORT_TIMEOUT_S
     ) -> ExportResultT:
         # After the call to shutdown, subsequent calls to Export are
         # not allowed and should return a Failure result.

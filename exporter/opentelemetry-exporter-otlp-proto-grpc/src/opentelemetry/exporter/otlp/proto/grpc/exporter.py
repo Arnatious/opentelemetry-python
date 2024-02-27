@@ -226,7 +226,7 @@ class OTLPExporterMixin(
         self,
         data: Union[TypingSequence[ReadableSpan], MetricsData],
         *,
-        timeout_millis: Optional[float] = None,
+        timeout_millis: float = _DEFAULT_EXPORT_TIMEOUT_S,
     ) -> ExportResultT:
         # After the call to shutdown, subsequent calls to Export are
         # not allowed and should return a Failure result.
