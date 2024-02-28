@@ -21,7 +21,6 @@ from abc import ABC, abstractmethod
 from io import BytesIO
 from logging import getLogger
 from os import environ
-from time import time
 from typing import (
     Dict,
     Generic,
@@ -30,8 +29,11 @@ from typing import (
     Union,
 )
 
+from opentelemetry.exporter.otlp.proto.common.exporter import (
+    RetryableExportError,
+    OTLPExporter
+)
 from opentelemetry.exporter.otlp.proto.common._internal import (
-    _create_exp_backoff_with_jitter_generator,
     InvalidCompressionValueException,
 )
 from opentelemetry.exporter.otlp.proto.http import (
@@ -52,17 +54,14 @@ import requests
 logger = getLogger(__name__)
 SDKDataT = TypeVar("SDKDataT")
 ResourceDataT = TypeVar("ResourceDataT")
-TypingResourceT = TypeVar("TypingResourceT")
 ExportServiceRequestT = TypeVar("ExportServiceRequestT")
 ExportResultT = TypeVar("ExportResultT")
 
-_DEFAULT_EXPORT_TIMEOUT_S = 10
 
-
-class OTLPExporterMixin(
-    ABC, Generic[SDKDataT, ExportServiceRequestT, ExportResultT]
+class OTLPHTTPExporter(
+    Generic[SDKDataT, ExportServiceRequestT, ExportResultT], OTLPExporter[SDKDataT, ExportResultT], ABC
 ):
-    """OTLP exporter
+    """OTLP HTTP exporter
 
     Args:
         endpoint: OpenTelemetry Collector receiver endpoint
@@ -75,15 +74,15 @@ class OTLPExporterMixin(
 
     def __init__(
         self,
-        *args,
         endpoint: Optional[str] = None,
         certificate_file: Optional[str] = None,
         headers: Optional[Dict[str, str],] = None,
         compression: Optional[Compression] = None,
         session: Optional[requests.Session] = None,
+        timeout: Optional[float] = None,
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(timeout=timeout, **kwargs)
 
         self._endpoint = endpoint or environ.get(
             OTEL_EXPORTER_OTLP_ENDPOINT, "http://localhost:4318"
@@ -109,91 +108,43 @@ class OTLPExporterMixin(
                 {"Content-Encoding": self._compression.value}
             )
 
-        self._shutdown = threading.Event()
-        self._export_lock = threading.Lock()
-
-    def _post(self, serialized_data: str):
-        data = serialized_data
+    def _export(
+        self,
+        data: SDKDataT,
+        timeout_millis: float,
+        *args,
+        **kwargs,
+    ) -> ExportResultT:
         if self._compression == Compression.Gzip:
             gzip_data = BytesIO()
             with gzip.GzipFile(fileobj=gzip_data, mode="w") as gzip_stream:
-                gzip_stream.write(serialized_data)
+                gzip_stream.write(data)
             data = gzip_data.getvalue()
         elif self._compression == Compression.Deflate:
-            data = zlib.compress(bytes(serialized_data))
+            data = zlib.compress(bytes(data))
 
-        return self._session.post(
+        resp = self._session.post(
             url=self._endpoint,
             data=data,
             verify=self._certificate_file,
-            timeout=self._timeout,
+            timeout=timeout_millis,
         )
 
-    def _export(
-        self, data: bytes, *, timeout_millis: float = _DEFAULT_EXPORT_TIMEOUT_S
-    ) -> ExportResultT:
-        # After the call to shutdown, subsequent calls to Export are
-        # not allowed and should return a Failure result.
-        if self._shutdown.is_set():
-            logger.warning("Exporter already shutdown, ignoring batch")
+        if resp.ok:
+            return self._result.SUCCESS
+        elif _status_code_retryable(resp):
+            raise RetryableExportError(
+                f"Transient error {resp.reason} encountered while exporting {self._exporting} batch",
+                resp.reason,
+                self._exporting,
+            )
+        else:
+            logger.error(
+                "Failed to export batch code: %s, reason: %s",
+                resp.status_code,
+                resp.text,
+            )
             return self._result.FAILURE
-
-        timeout_s = min((timeout_millis / 1e3), self._timeout)
-        deadline_s = time() + timeout_s
-        # We acquire a lock to prevent shutdown from interrupting us
-        try:
-            if not self._export_lock.acquire(timeout=timeout_s):
-                logger.warning(
-                    "Exporter failed to acquire lock before timeout"
-                )
-                return self._result.FAILURE
-            # _create_exp_backoff_with_jitter returns a generator that yields random delay
-            # values whose upper bounds grow exponentially. The upper bound will cap at max
-            # value (never wait more than 64 seconds at once)
-            max_value = 64
-            for delay_s in _create_exp_backoff_with_jitter_generator(
-                max_value=max_value
-            ):
-                remaining_time_s = deadline_s - time()
-
-                if remaining_time_s < 1e-09:
-                    logger.warning(
-                        "Timed out exporting %s to %s",
-                        self._exporting,
-                        self._endpoint,
-                    )
-                    return self._result.FAILURE
-                if self._shutdown.is_set():
-                    logger.warning(
-                        "Shutdown encountered while exporting %s to %s",
-                        self._exporting,
-                        self._endpoint,
-                    )
-                    return self._result.FAILURE
-
-                resp = self._post(data)
-
-                if resp.ok:
-                    return self._result.SUCCESS
-                elif self._retryable(resp):
-                    time_remaining_s = deadline_s - time()
-                    delay_s = min(delay_s, time_remaining_s)
-                    logger.warning(
-                        "Transient error %s encountered while exporting %s batch, retrying in %ss.",
-                        resp.reason,
-                        self._exporting,
-                        delay_s,
-                    )
-                    self._shutdown.wait(delay_s)
-                else:
-                    logger.error(
-                        "Failed to export batch code: %s, reason: %s",
-                        resp.status_code,
-                        resp.text,
-                    )
-                    return self._result.FAILURE
-        finally:
-            self._export_lock.release()
 
     def shutdown(self, timeout_millis: float = 30_000, **kwargs):
         if self._shutdown.is_set():
@@ -205,34 +156,17 @@ class OTLPExporterMixin(
         if locked:
             self._export_lock.release()
 
-    @staticmethod
-    def _retryable(resp: requests.Response) -> bool:
-        if resp.status_code == 408:
-            return True
-        if resp.status_code >= 500 and resp.status_code <= 599:
-            return True
-        return False
-
-    @property
-    @abstractmethod
-    def _exporting(self) -> str:
-        """
-        Returns a string that describes the overall exporter, to be used in
-        warning messages.
-        """
-        pass
-
-    @property
-    @abstractmethod
-    def _result(self) -> ExportResultT:
-        """
-        Enum defining export result states to be used.
-        """
-        pass
-
     @abstractmethod
     def _append_telemetry_signal_path(self, endpoint: str) -> str:
         pass
+
+
+def _status_code_retryable(resp: requests.Response) -> bool:
+    if resp.status_code == 408:
+        return True
+    if resp.status_code >= 500 and resp.status_code <= 599:
+        return True
+    return False
 
 
 def environ_to_compression(environ_key: str) -> Optional[Compression]:

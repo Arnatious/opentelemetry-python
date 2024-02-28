@@ -14,6 +14,7 @@
 """OTLP Span Exporter"""
 
 import logging
+from functools import partial
 from os import environ
 from typing import Dict, Optional, Sequence, Tuple, Union
 from typing import Sequence as TypingSequence
@@ -143,10 +144,10 @@ class OTLPSpanExporter(
         timeout_millis: float = 10_000,
         **kwargs,
     ) -> SpanExportResult:
-        return self._export(spans, timeout_millis=timeout_millis)
-
-    def shutdown(self) -> None:
-        OTLPExporterMixin.shutdown(self)
+        return self._exporter.export_with_retry(
+            partial(self._export, data=spans),
+            timeout_s=timeout_millis * 1e-3 
+        )
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         """Nothing is buffered in this exporter, so this method does nothing."""

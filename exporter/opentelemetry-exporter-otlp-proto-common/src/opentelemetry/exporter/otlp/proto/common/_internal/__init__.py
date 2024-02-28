@@ -192,7 +192,7 @@ def _create_exp_backoff_with_jitter_generator(max_value: int = 0) -> Iterator[fl
     Returns:
     Iterator[int]: An iterator that yields the exponential backoff values, either uncapped or
     capped at max_value.
-Y
+
     Example:
     ```
     import random
