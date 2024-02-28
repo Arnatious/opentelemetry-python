@@ -50,6 +50,7 @@ from grpc import (
 )
 
 from opentelemetry.exporter.otlp.proto.common.exporter import (
+    ExportResult,
     RetryingExporter,
     RetryableExportError,
 )
@@ -138,7 +139,8 @@ class ServiceStubProtocol(Protocol):
 
 # pylint: disable=no-member
 class OTLPExporterMixin(
-    ABC, Generic[SDKDataT, ExportServiceRequestT, ExportResultT]
+    ABC,
+    Generic[SDKDataT, ExportServiceRequestT, ExportResultT],
 ):
     """OTLP exporter
 
@@ -222,12 +224,7 @@ class OTLPExporterMixin(
             )
 
         self._shutdown = False
-        self._exporter = RetryingExporter(
-            self._result,
-            self._exporting,
-            self._endpoint,
-            self._timeout,
-        )
+        self._exporter = RetryingExporter(self._result, self._timeout)
 
     @abstractmethod
     def _translate_data(
@@ -304,8 +301,7 @@ class OTLPExporterMixin(
         self._shutdown = True
 
     @abstractmethod
-    def _stub(self, channel: Channel) -> ServiceStubProtocol:
-        pass
+    def _stub(self, channel: Channel) -> ServiceStubProtocol: ...
 
     @property
     @abstractmethod
@@ -318,7 +314,7 @@ class OTLPExporterMixin(
 
     @property
     @abstractmethod
-    def _result(self) -> type[ExportResultT]:
+    def _result(self) -> type[ExportResult[ExportResultT]]:
         """
         Enum defining export result states to be used.
         """

@@ -12,6 +12,7 @@
 # limitations under the License.
 
 from dataclasses import replace
+from functools import partial
 from logging import getLogger
 from os import environ
 from time import time
@@ -156,17 +157,17 @@ class OTLPMetricExporter(
         timeout_millis: float = 10_000,
         **kwargs,
     ) -> MetricExportResult:
-        timeout_millis = min(timeout_millis, self._timeout * 1e3)
-        deadline_millis = timeout_millis + (time() * 1e3)
+        timeout_s = min(timeout_millis * 1e-3, self._timeout)
+        deadline_s = time() + timeout_s
 
         if self._max_export_batch_size is None:
-            return self._export(data=metrics_data)
+            return self._exporter.export_with_retry(data=metrics_data)
 
         export_result = MetricExportResult.SUCCESS
 
         for split_metrics_data in self._split_metrics_data(metrics_data):
-            remaining_time_millis = deadline_millis - (time() * 1e3)
-            split_export_result = self._export(data=split_metrics_data, timeout_millis=remaining_time_millis)
+            remaining_time_s = deadline_s - time()
+            split_export_result = self._exporter.export_with_retry(partial(self._export, data=split_metrics_data), timeout_s=remaining_time_s)
 
             if split_export_result is MetricExportResult.FAILURE:
                 export_result = MetricExportResult.FAILURE

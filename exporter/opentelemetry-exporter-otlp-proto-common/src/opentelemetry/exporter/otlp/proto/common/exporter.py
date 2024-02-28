@@ -6,12 +6,15 @@ from io import BytesIO
 from itertools import count
 from logging import getLogger
 from os import environ
+from random import uniform
 from time import time
 from typing import (
     Callable,
+    ClassVar,
     Generic,
     Iterator,
     Optional,
+    Protocol,
     Type,
     TypeVar,
 )
@@ -30,10 +33,17 @@ ExportResultT = TypeVar("ExportResultT")
 _DEFAULT_EXPORT_TIMEOUT_S = 10
 
 
+class ExportResult(Protocol[ExportResultT]):
+    SUCCESS: ClassVar[ExportResultT]
+    FAILURE: ClassVar[ExportResultT]
+
+
+class ExportProtocol(Protocol[ExportResultT]):
+    def __call__(self, *args, timeout_s: Optional[float] = None, **kwargs) -> ExportResultT: ...
+
+
 class RetryableExportError(Exception):
-    def __init__(
-        self, retry_delay_s: Optional[float] = None
-    ):
+    def __init__(self, retry_delay_s: Optional[float] = None):
         super().__init__()
 
         self.retry_delay_s = retry_delay_s
@@ -43,9 +53,8 @@ class RetryingExporter(Generic[ExportResultT]):
 
     def __init__(
         self,
-        result_type: Type[ExportResultT],
-        exporting: str,
-        endpoint: str,
+        result_type: Type[ExportResult[ExportResultT]],
+        export_function: ExportProtocol[ExportResultT],
         timeout_s: Optional[float] = None,
     ):
         """OTLP exporter helper class.
@@ -53,16 +62,13 @@ class RetryingExporter(Generic[ExportResultT]):
         Encapsulates timeout behavior for shutdown and export tasks.
 
         Args:
-            result_types: enum defining SUCCESS and FAILURE values for export.
-            exporting: A string that describes the overall exporter, to be used
-                in warning messages.
-            endpoint: Export endpoint for use in logging.
+            result_type: Enum-like type defining SUCCESS and FAILURE values
+                returned by export.
             timeout_s: Optional timeout for exports in seconds. If None, will
                 be populated from environment variable or constant.
         """
-        self._result_type = result_type,
-        self._exporting = exporting
-        self._endpoint = endpoint
+        self._result_type = result_type
+        self._export_function = export_function
         self._timeout_s = timeout_s or float(
             environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, _DEFAULT_EXPORT_TIMEOUT_S)
         )
@@ -81,31 +87,33 @@ class RetryingExporter(Generic[ExportResultT]):
 
     def export_with_retry(
         self,
-        export_function: Callable[[Optional[float],], ExportResultT],
+        *args,
         timeout_s: float,
+        **kwargs,
     ) -> ExportResultT:
         """Exports data with handling of retryable errors.
 
         Takes a user supplied export function of the form
 
-            def export(timeout: Optional[float]) -> ExportResultT
+            def export(timeout_s: Optional[float]) -> ExportResultT
                 ...
 
-        That either returns the appropriate export result, or raises a
+        that either returns the appropriate export result, or raises a
         RetryableExportError exception if the encountered error should
-        be retried.
+        be retried. The function's optional timeout_s parameter should be
+        passed on to any blocking operations that accept a timeout.
 
         Retries will be attempted using exponential backoff with full jitter.
-        If retry_delay_s is specified in the RetryableExportError, and that
-        delay is less than the remaining timeout, then will wait at least 
-        retry_delay_s seconds until next attempt.
+        If retry_delay_s is specified in the raised error, a retry attempt will
+        not occur before that delay. If a retry after that delay is
+        not possible, will immediately abort without retrying.
 
         Will reattempt the export until timeout has passed, at which point
         the export will be abandoned and a failure will be returned.
         A pending shutdown timing out will also cause retries to time out.
 
         Args:
-            export_function: A function handling the encoding and export step 
+            export_function: A function handling the encoding and export step
                 without retries. Function should return an ExportResultT or
                 raise RetryableExportError if a retryable error is encountered
             timeout_s: Timeout in seconds. No more reattempts will occur after
@@ -138,24 +146,20 @@ class RetryingExporter(Generic[ExportResultT]):
                 remaining_time_s = deadline_s - time()
 
                 if remaining_time_s < 1e-09:
-                    logger.warning(
-                        "Timed out exporting %s to %s",
-                        self._exporting,
-                        self._endpoint,
-                    )
+                    # Timed out
                     return self._result_type.FAILURE
 
                 if self._shutdown_event.is_set():
                     logger.warning(
-                        "Shutdown encountered while exporting %s to %s",
-                        self._exporting,
-                        self._endpoint,
+                        "Export cancelled due to shutdown timing out",
                     )
                     return self._result_type.FAILURE
 
                 try:
-                    return export_function(
-                        timeout_millis=remaining_time_s,
+                    return self._export_function(
+                        *args,
+                        timeout_s=remaining_time_s,
+                        **kwargs,
                     )
                 except RetryableExportError as err:
                     time_remaining_s = deadline_s - time()
@@ -163,12 +167,11 @@ class RetryingExporter(Generic[ExportResultT]):
                     if err.retry_delay_s is not None:
                         if err.retry_delay_s > time_remaining_s:
                             # We should not retry before the requested interval, so
-                            # we must fail out prematurely
+                            # we must fail out prematurely.
                             return self._result_type.FAILURE
                         delay_s = max(err.retry_delay_s, delay_s)
                     logger.warning(
-                        "%s, retrying in %ss.",
-                        err.log_warning_message,
+                        "Retrying in %ss",
                         delay_s,
                     )
                     self._shutdown_event.wait(delay_s)
