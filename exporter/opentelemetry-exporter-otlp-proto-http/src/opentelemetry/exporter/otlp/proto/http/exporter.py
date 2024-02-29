@@ -31,7 +31,6 @@ from typing import (
 
 from opentelemetry.exporter.otlp.proto.common.exporter import (
     RetryableExportError,
-    OTLPExporter
 )
 from opentelemetry.exporter.otlp.proto.common._internal import (
     InvalidCompressionValueException,
@@ -58,8 +57,8 @@ ExportServiceRequestT = TypeVar("ExportServiceRequestT")
 ExportResultT = TypeVar("ExportResultT")
 
 
-class OTLPHTTPExporter(
-    Generic[SDKDataT, ExportServiceRequestT, ExportResultT], OTLPExporter[SDKDataT, ExportResultT], ABC
+class OTLPExporterMixin(
+    Generic[SDKDataT, ExportServiceRequestT, ExportResultT], ABC
 ):
     """OTLP HTTP exporter
 
@@ -76,7 +75,7 @@ class OTLPHTTPExporter(
         self,
         endpoint: Optional[str] = None,
         certificate_file: Optional[str] = None,
-        headers: Optional[Dict[str, str],] = None,
+        headers: Optional[Dict[str, str]] = None,
         compression: Optional[Compression] = None,
         session: Optional[requests.Session] = None,
         timeout: Optional[float] = None,

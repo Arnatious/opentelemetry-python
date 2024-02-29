@@ -24,11 +24,9 @@ from opentelemetry.exporter.otlp.proto.common._internal import (
 )
 from opentelemetry.exporter.otlp.proto.http import Compression
 from opentelemetry.exporter.otlp.proto.http.exporter import (
-    _DEFAULT_EXPORT_TIMEOUT_S,
     ExportServiceRequestT,
     OTLPExporterMixin,
     SDKDataT,
-    StatusCode,
     environ_to_compression,
 )
 from opentelemetry.sdk.environment_variables import OTEL_EXPORTER_OTLP_TIMEOUT

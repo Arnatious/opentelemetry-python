@@ -53,15 +53,30 @@ class RetryingExporter(Generic[ExportResultT]):
 
     def __init__(
         self,
-        result_type: Type[ExportResult[ExportResultT]],
         export_function: ExportProtocol[ExportResultT],
+        result_type: Type[ExportResult[ExportResultT]],
         timeout_s: Optional[float] = None,
     ):
         """OTLP exporter helper class.
 
         Encapsulates timeout behavior for shutdown and export tasks.
 
+        Accepts a callable `export_function` of the form
+
+            def export_function(
+                *args, 
+                timeout_s: Optional[float], 
+                **kwargs
+            ) -> result_type:
+                ....
+
+        that either returns the appropriate export result, or raises a
+        RetryableExportError exception if the encountered error should
+        be retried.
+
         Args:
+            export_function: A callable handling a single export attempt to
+                be used by export_with_retry()
             result_type: Enum-like type defining SUCCESS and FAILURE values
                 returned by export.
             timeout_s: Optional timeout for exports in seconds. If None, will
@@ -87,21 +102,19 @@ class RetryingExporter(Generic[ExportResultT]):
 
     def export_with_retry(
         self,
-        *args,
         timeout_s: float,
+        *args,
         **kwargs,
     ) -> ExportResultT:
         """Exports data with handling of retryable errors.
 
-        Takes a user supplied export function of the form
+        Calls the export_function provided at initialization with the following
+        signature:
 
-            def export(timeout_s: Optional[float]) -> ExportResultT
-                ...
+            export_function(*args, timeout_s=remaining_time, **kwargs)
 
-        that either returns the appropriate export result, or raises a
-        RetryableExportError exception if the encountered error should
-        be retried. The function's optional timeout_s parameter should be
-        passed on to any blocking operations that accept a timeout.
+        where `remaining_time` is updated with each retry, and *args and 
+        **kwargs are forwarded as-is.
 
         Retries will be attempted using exponential backoff with full jitter.
         If retry_delay_s is specified in the raised error, a retry attempt will
@@ -112,12 +125,15 @@ class RetryingExporter(Generic[ExportResultT]):
         the export will be abandoned and a failure will be returned.
         A pending shutdown timing out will also cause retries to time out.
 
+        Note: Can block longer than timeout if export_function is blocking. 
+            Ensure export_function blocks minimally and does not attempt
+            retries.
+
         Args:
-            export_function: A function handling the encoding and export step
-                without retries. Function should return an ExportResultT or
-                raise RetryableExportError if a retryable error is encountered
-            timeout_s: Timeout in seconds. No more reattempts will occur after
+            timeout_s: Timeout in seconds. No more reattempts will occur after 
                 this time.
+            *args: Variable length argument list forwarded to underlying export
+            **kwargs: Arbitrary keyword arguments forwarded to underlying export
 
         """
         # After the call to shutdown, subsequent calls to Export are
