@@ -23,23 +23,18 @@ from opentelemetry.sdk.environment_variables import (
     OTEL_EXPORTER_OTLP_TIMEOUT,
 )
 
-from opentelemetry.exporter.otlp.proto.common._internal import (
-    _create_exp_backoff_with_jitter_generator,
-)
-
 logger = getLogger(__name__)
-ExportResultT = TypeVar("ExportResultT")
 
 _DEFAULT_EXPORT_TIMEOUT_S = 10
 
-
-class ExportResult(Protocol[ExportResultT]):
-    SUCCESS: ClassVar[ExportResultT]
-    FAILURE: ClassVar[ExportResultT]
+ExportResultT = TypeVar("ExportResultT")
+ExportResultCovariantT = TypeVar("ExportResultCovariantT", covariant=True)
 
 
-class ExportProtocol(Protocol[ExportResultT]):
-    def __call__(self, *args, timeout_s: Optional[float] = None, **kwargs) -> ExportResultT: ...
+class _ExportProtocol(Protocol[ExportResultCovariantT]):
+    def __call__(
+        self, timeout_s: float, *args, **kwargs
+    ) -> ExportResultCovariantT: ...
 
 
 class RetryableExportError(Exception):
@@ -53,8 +48,8 @@ class RetryingExporter(Generic[ExportResultT]):
 
     def __init__(
         self,
-        export_function: ExportProtocol[ExportResultT],
-        result_type: Type[ExportResult[ExportResultT]],
+        export_function: _ExportProtocol[ExportResultT],
+        result_type: ExportResultT,
         timeout_s: Optional[float] = None,
     ):
         """OTLP exporter helper class.
@@ -64,8 +59,8 @@ class RetryingExporter(Generic[ExportResultT]):
         Accepts a callable `export_function` of the form
 
             def export_function(
-                *args, 
-                timeout_s: Optional[float], 
+                timeout_s: float,
+                *args,
                 **kwargs
             ) -> result_type:
                 ....
@@ -113,7 +108,7 @@ class RetryingExporter(Generic[ExportResultT]):
 
             export_function(*args, timeout_s=remaining_time, **kwargs)
 
-        where `remaining_time` is updated with each retry, and *args and 
+        where `remaining_time` is updated with each retry, and *args and
         **kwargs are forwarded as-is.
 
         Retries will be attempted using exponential backoff with full jitter.
@@ -125,12 +120,12 @@ class RetryingExporter(Generic[ExportResultT]):
         the export will be abandoned and a failure will be returned.
         A pending shutdown timing out will also cause retries to time out.
 
-        Note: Can block longer than timeout if export_function is blocking. 
+        Note: Can block longer than timeout if export_function is blocking.
             Ensure export_function blocks minimally and does not attempt
             retries.
 
         Args:
-            timeout_s: Timeout in seconds. No more reattempts will occur after 
+            timeout_s: Timeout in seconds. No more reattempts will occur after
                 this time.
             *args: Variable length argument list forwarded to underlying export
             **kwargs: Arbitrary keyword arguments forwarded to underlying export
@@ -143,7 +138,11 @@ class RetryingExporter(Generic[ExportResultT]):
             return self._result_type.FAILURE
 
         # Use the lowest of the possible timeouts
-        timeout_s = min(timeout_s, self._timeout_s)
+        timeout_s = (
+            min(timeout_s, self._timeout_s)
+            if timeout_s is not None
+            else self._timeout_s
+        )
         deadline_s = time() + timeout_s
         # We acquire a lock to prevent shutdown from interrupting us
         try:
@@ -173,8 +172,8 @@ class RetryingExporter(Generic[ExportResultT]):
 
                 try:
                     return self._export_function(
+                        remaining_time_s,
                         *args,
-                        timeout_s=remaining_time_s,
                         **kwargs,
                     )
                 except RetryableExportError as err:
