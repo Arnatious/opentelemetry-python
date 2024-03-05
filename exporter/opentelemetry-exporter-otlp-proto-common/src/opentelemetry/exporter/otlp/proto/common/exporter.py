@@ -1,21 +1,15 @@
-import gzip
+import math
 import threading
-import zlib
-from abc import ABC, abstractmethod
-from io import BytesIO
 from itertools import count
 from logging import getLogger
 from os import environ
 from random import uniform
 from time import time
 from typing import (
-    Callable,
-    ClassVar,
     Generic,
     Iterator,
     Optional,
     Protocol,
-    Type,
     TypeVar,
 )
 
@@ -74,14 +68,25 @@ class RetryingExporter(Generic[ExportResultT]):
                 be used by export_with_retry()
             result_type: Enum-like type defining SUCCESS and FAILURE values
                 returned by export.
-            timeout_s: Optional timeout for exports in seconds. If None, will
-                be populated from environment variable or constant.
+            timeout_s: Optional timeout for exports in seconds. Set to smaller
+                of provided arg and value in OTEL_EXPORTER_OTLP_TIMEOUT. Defaults
+                to constant if both are unset.
         """
         self._result_type = result_type
         self._export_function = export_function
-        self._timeout_s = timeout_s or float(
-            environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, _DEFAULT_EXPORT_TIMEOUT_S)
-        )
+        if timeout_s:
+            # If the user provided a timeout, don't use the default as a lower
+            # bound.
+            self._timeout_s = min(
+                timeout_s,
+                float(environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, math.inf)),
+            )
+        else:
+            self._timeout_s = float(
+                environ.get(
+                    OTEL_EXPORTER_OTLP_TIMEOUT, _DEFAULT_EXPORT_TIMEOUT_S
+                )
+            )
 
         self._shutdown_event = threading.Event()
         self._export_lock = threading.Lock()

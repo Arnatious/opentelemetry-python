@@ -1,11 +1,12 @@
 import time
+import threading
 import unittest
 from itertools import repeat
 from logging import WARNING
 from unittest.mock import Mock, patch, ANY
 
+from opentelemetry.sdk.environment_variables import OTEL_EXPORTER_OTLP_TIMEOUT
 from opentelemetry.exporter.otlp.proto.common.exporter import (
-    _ExportProtocol,
     RetryableExportError,
     RetryingExporter,
     _DEFAULT_EXPORT_TIMEOUT_S,
@@ -72,8 +73,50 @@ class TestRetryableExporter(unittest.TestCase):
             self.assertEqual(export_func.call_count, len(side_effect))
             self.assertIs(result, result_type.FAILURE)
 
+    def test_export_uses_smallest_timeout(self):
+        """
+        Test that the exporter uses the smallest of attribute, argument,
+        environment variable as timeout.
+        """
+
+        def patch_and_time(attrib_timeout, environ_timeout, arg_timeout):
+            export_func = Mock(side_effect=RetryableExportError())
+            with patch.dict(
+                "os.environ",
+                {OTEL_EXPORTER_OTLP_TIMEOUT: str(environ_timeout)},
+            ):
+                start = time.time()
+                exporter = RetryingExporter(
+                    export_func, result_type, timeout_s=attrib_timeout
+                )
+                exporter.export_with_retry(arg_timeout)
+            duration = time.time() - start
+            self.assertAlmostEqual(
+                duration,
+                min(attrib_timeout, environ_timeout, arg_timeout),
+                places=1,
+            )
+
+        patch_and_time(2, 10, 10)
+        patch_and_time(10, 2, 10)
+        patch_and_time(10, 10, 2)
+
+    def test_explicit_environ_timeout_beats_default(self):
+        """Ensure a specific timeout in environment can be higher than default."""
+        with patch.dict(
+            "os.environ",
+            {OTEL_EXPORTER_OTLP_TIMEOUT: str(2 * _DEFAULT_EXPORT_TIMEOUT_S)},
+        ):
+            self.assertEqual(
+                RetryingExporter(Mock(), result_type)._timeout_s,
+                2 * _DEFAULT_EXPORT_TIMEOUT_S,
+            )
+
     @patch(
-        "opentelemetry.exporter.otlp.proto.common.exporter._create_exp_backoff_with_jitter_generator",
+        (
+            "opentelemetry.exporter.otlp.proto.common.exporter"
+            "._create_exp_backoff_with_jitter_generator"
+        ),
         return_value=repeat(0.25),
     )
     def test_export_uses_retry_delay(self, mock_backoff):
@@ -87,30 +130,169 @@ class TestRetryableExporter(unittest.TestCase):
             RetryableExportError(1),
             result_type.SUCCESS,
         ]
+        exporter = RetryingExporter(
+            Mock(side_effect=side_effects), result_type
+        )
 
-        class ExportDelayRecorder(_ExportProtocol):
-            def __init__(self):
-                self.delays_s = []
-                self.prev_call_time = None
-                self.mock = Mock(side_effect=side_effects)
-
-            def __call__(self, timeout_s, *args, **kwargs):
-                now = time.time()
-                if self.prev_call_time is not None:
-                    self.delays_s.append(now - self.prev_call_time)
-                self.prev_call_time = now
-                return self.mock(timeout_s, *args, **kwargs)
-
-        export_func = ExportDelayRecorder()
-        exporter = RetryingExporter(export_func, result_type)
-
-        with patch.object(exporter._shutdown_event, 'sleep'):
+        with patch.object(exporter._shutdown_event, "wait") as wait_mock:
             result = exporter.export_with_retry(timeout_s=10, foo="bar")
         self.assertIs(result, result_type.SUCCESS)
-        self.assertEqual(export_func.mock.call_count, len(side_effects))
-        self.assertAlmostEqual(export_func.delays_s[0], 0.25, places=2)
-        self.assertAlmostEqual(export_func.delays_s[1], 0.25, places=2)
-        self.assertAlmostEqual(export_func.delays_s[2], 0.75, places=2)
-        self.assertAlmostEqual(export_func.delays_s[3], 1.00, places=2)
+        self.assertEqual(wait_mock.call_count, len(side_effects) - 1)
+        self.assertEqual(wait_mock.call_args_list[0].args, (0.25,))
+        self.assertEqual(wait_mock.call_args_list[1].args, (0.25,))
+        self.assertEqual(wait_mock.call_args_list[2].args, (0.75,))
+        self.assertEqual(wait_mock.call_args_list[3].args, (1.00,))
 
-    # def
+    @patch(
+        (
+            "opentelemetry.exporter.otlp.proto.common.exporter"
+            "._create_exp_backoff_with_jitter_generator"
+        ),
+        return_value=repeat(0.1),
+    )
+    def test_retry_delay_exceeds_timeout(self, mock_backoff):
+        """
+        Test we timeout if we can't respect retry_delay.
+        """
+        side_effects = [
+            RetryableExportError(0.25),
+            RetryableExportError(1),  # should timeout here
+            result_type.SUCCESS,
+        ]
+
+        mock_export_func = Mock(side_effect=side_effects)
+        exporter = RetryingExporter(
+            mock_export_func,
+            result_type,
+        )
+
+        self.assertEqual(exporter.export_with_retry(0.5), result_type.FAILURE)
+        self.assertEqual(mock_export_func.call_count, 2)
+
+    def test_shutdown(self):
+        """Test we refuse to export if shut down."""
+        mock_export_func = Mock(return_value=result_type.SUCCESS)
+        exporter = RetryingExporter(
+            mock_export_func,
+            result_type,
+        )
+
+        self.assertEqual(exporter.export_with_retry(10), result_type.SUCCESS)
+        mock_export_func.assert_called_once()
+        exporter.shutdown()
+        with self.assertLogs(level=WARNING) as warning:
+            self.assertEqual(
+                exporter.export_with_retry(10), result_type.FAILURE
+            )
+        self.assertEqual(
+            warning.records[0].message,
+            "Exporter already shutdown, ignoring batch",
+        )
+        mock_export_func.assert_called_once()
+
+    def test_shutdown_wait_last_export(self):
+        """Test that shutdown waits for ongoing export to complete."""
+
+        timeout_s = 10
+
+        class ExportFunc:
+            is_exporting = threading.Event()
+            ready_to_continue = threading.Event()
+            side_effect = [
+                RetryableExportError(),
+                RetryableExportError(),
+                result_type.SUCCESS,
+            ]
+            mock_export_func = Mock(side_effect=side_effect)
+
+            def __call__(self, *args, **kwargs):
+                self.is_exporting.set()
+                self.ready_to_continue.wait()
+                return self.mock_export_func(*args, **kwargs)
+
+        export_func = ExportFunc()
+
+        exporter = RetryingExporter(
+            export_func, result_type, timeout_s=timeout_s
+        )
+
+        class ExportWrap:
+            def __init__(self) -> None:
+                self.result = None
+
+            def __call__(self, *args, **kwargs):
+                self.result = exporter.export_with_retry(timeout_s)
+                return self.result
+
+        export_wrapped = ExportWrap()
+
+        export_thread = threading.Thread(target=export_wrapped)
+        try:
+            export_thread.start()
+            export_func.is_exporting.wait()
+            start_time = time.time()
+            shutdown_thread = threading.Thread(target=exporter.shutdown)
+            shutdown_thread.start()
+            time.sleep(0.25)
+            export_func.ready_to_continue.set()
+        finally:
+            export_thread.join()
+            shutdown_thread.join()
+
+        duration = time.time() - start_time
+        self.assertLessEqual(duration, timeout_s)
+        self.assertTrue(exporter._shutdown_event.is_set())
+        self.assertIs(export_wrapped.result, result_type.SUCCESS)
+
+    def test_shutdown_timeout_cancels_export_retries(self):
+        """Test that shutdown timing out cancels ongoing retries."""
+
+        class ExportFunc:
+            is_exporting = threading.Event()
+            ready_to_continue = threading.Event()
+            mock_export_func = Mock(side_effect=RetryableExportError())
+
+            def __call__(self, *args, **kwargs):
+                self.is_exporting.set()
+                self.ready_to_continue.wait()
+                return self.mock_export_func(*args, **kwargs)
+
+        export_func = ExportFunc()
+
+        exporter = RetryingExporter(export_func, result_type, timeout_s=30)
+
+        class ExportWrap:
+            def __init__(self) -> None:
+                self.result = None
+
+            def __call__(self, *args, **kwargs):
+                self.result = exporter.export_with_retry(30)
+                return self.result
+
+        export_wrapped = ExportWrap()
+
+        shutdown_timeout = 1
+
+        export_thread = threading.Thread(target=export_wrapped)
+        with self.assertLogs(level=WARNING) as warning:
+            try:
+                export_thread.start()
+                export_func.is_exporting.wait()
+                start_time = time.time()
+                shutdown_thread = threading.Thread(
+                    target=exporter.shutdown, args=[shutdown_timeout * 1e3]
+                )
+                shutdown_thread.start()
+                time.sleep(0)
+                export_func.ready_to_continue.set()
+            finally:
+                export_thread.join()
+                shutdown_thread.join()
+        duration = time.time() - start_time
+        self.assertAlmostEqual(duration, shutdown_timeout, places=1)
+        self.assertTrue(exporter._shutdown_event.is_set())
+        self.assertIs(export_wrapped.result, result_type.FAILURE)
+        self.assertEqual(
+            warning.records[-1].message,
+            "Export cancelled due to shutdown timing out",
+        )
